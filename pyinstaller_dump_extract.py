@@ -223,6 +223,12 @@ def extract_from_memory_dump(dump_path):
     print(f"[*] Using Pyc Header for Python {py_ver}")
     pyc_header = build_pyc_header(magic_bytes, py_ver)
 
+    # marshal is strictly minor-version dependent
+    current_ver = f"3.{sys.version_info.minor}"
+    if current_ver != py_ver:
+        print(f"[-] VERSION MISMATCH: Dump contains Python {py_ver} but script is running with Python {current_ver}!")
+        sys.exit(1)
+
     extracted_files = 0
     extracted_names = set()
     extracted_hashes = set() # Store hashes to deduplicate identical modules
