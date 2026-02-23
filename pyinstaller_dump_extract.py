@@ -145,7 +145,37 @@ def extract_zip_archives(data, out_dir):
             
         start = idx + 16
 
-    print(f"  [*] Extracted {zip_count} ZIP archives and {sqlite_count} SQLite databases.")
+    # 3. Carve PyInstaller PYZ archives
+    start = 0
+    pyz_count = 0
+    pyz_magic = b'PYZ\x00'
+    while True:
+        idx = data.find(pyz_magic, start)
+        if idx == -1:
+            break
+            
+        try:
+            # PYZ archives in memory dumps are tricky because they don't have a strict end marker
+            # But they usually contain a TOC (Table of Contents) followed by zlib code objects.
+            # A conservative 15MB dump from the PYZ signature is usually enough to capture the entire
+            # bundled archive so external tools like `pyinstxtractor` can parse it.
+            pyz_end = min(idx + 15 * 1024 * 1024, len(data))
+            pyz_data = data[idx:pyz_end]
+            
+            # Write it out
+            out_path = os.path.join(out_dir, f"embedded_archive_{idx:X}.pyz")
+            with open(out_path, 'wb') as f:
+                f.write(pyz_data)
+                
+            print(f"  [+] Extracted PYZ Archive: embedded_archive_{idx:X}.pyz (15.0 MB)")
+            pyz_count += 1
+            
+            # Jump forward
+            start = idx + 1024 * 1024
+        except Exception:
+            start = idx + 4
+
+    print(f"  [*] Extracted {zip_count} ZIP archives, {sqlite_count} SQLite databases, and {pyz_count} PYZ archives.")
 
 
 def extract_from_memory_dump(dump_path):
@@ -206,7 +236,7 @@ def extract_from_memory_dump(dump_path):
             return
 
         # Deduplicate identical bytecode payloads
-        payload_hash = hashlib.md5(raw_bytes).hexdigest()
+        payload_hash = hashlib.sha512(raw_bytes).hexdigest()
         if payload_hash in extracted_hashes:
             return  # Skip identical duplicates
         
