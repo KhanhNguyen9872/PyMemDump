@@ -70,28 +70,40 @@ def extract_zip_archives(data, out_dir):
             break
             
         try:
-            # We will attempt to carve the ZIP by jumping exactly to the End of Central Directory (EOCD)
-            # Or we can just dump a conservative 50MB chunk which a zip extractor tool can easily recover
-            # Best effort carving without full ZIP parsing:
+            # A valid ZIP file EOCD record is marked by PK\x05\x06.
+            # However, this sequence can randomly appear in compressed data.
+            # We must search forward and validate that the EOCD cd_offset + cd_size == its own relative position
             eocd_idx = data.find(b'PK\x05\x06', idx)
-            if eocd_idx != -1 and (eocd_idx - idx) < 50 * 1024 * 1024:
+            found_valid_zip = False
+            
+            while eocd_idx != -1 and (eocd_idx - idx) < 250 * 1024 * 1024: # max 250MB search
                 # EOCD record is at least 22 bytes long
-                end_idx = eocd_idx + 22
-                
-                # Double check for ZIP comment length
-                if end_idx + 2 <= len(data):
-                    comment_len = struct.unpack('<H', data[eocd_idx+20:eocd_idx+22])[0]
-                    end_idx += comment_len
+                if eocd_idx + 22 <= len(data):
+                    cd_size = struct.unpack('<I', data[eocd_idx+12:eocd_idx+16])[0]
+                    cd_offset = struct.unpack('<I', data[eocd_idx+16:eocd_idx+20])[0]
                     
-                zip_data = data[idx:end_idx]
-                out_path = os.path.join(out_dir, f"embedded_archive_{idx:X}.zip")
-                with open(out_path, 'wb') as f:
-                    f.write(zip_data)
+                    # Check if the Central Directory ends exactly where this EOCD begins
+                    if cd_offset + cd_size == (eocd_idx - idx):
+                        comment_len = struct.unpack('<H', data[eocd_idx+20:eocd_idx+22])[0]
+                        end_idx = eocd_idx + 22 + comment_len
+                        
+                        zip_data = data[idx:end_idx]
+                        out_path = os.path.join(out_dir, f"embedded_archive_{idx:X}.zip")
+                        with open(out_path, 'wb') as f:
+                            f.write(zip_data)
+                        
+                        print(f"  [+] Extracted ZIP Archive: embedded_archive_{idx:X}.zip ({len(zip_data)/1024:.1f} KB)")
+                        zip_count += 1
+                        start = end_idx
+                        found_valid_zip = True
+                        break
                 
-                print(f"  [+] Extracted ZIP Archive: embedded_archive_{idx:X}.zip ({len(zip_data)/1024:.1f} KB)")
-                zip_count += 1
-                start = end_idx
+                # Keep searching if this wasn't the true EOCD
+                eocd_idx = data.find(b'PK\x05\x06', eocd_idx + 4)
+                
+            if found_valid_zip:
                 continue
+                
         except Exception:
             pass
             
