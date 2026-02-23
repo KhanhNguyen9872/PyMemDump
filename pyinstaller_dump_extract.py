@@ -136,7 +136,7 @@ def extract_zip_archives(data, out_dir):
     print(f"  [*] Extracted {zip_count} ZIP archives and {sqlite_count} SQLite databases.")
 
 
-def extract_from_memory_dump(dump_path, extract_strings_flag=False, extract_files_flag=False):
+def extract_from_memory_dump(dump_path):
     if not os.path.exists(dump_path):
         print(f"Error: Could not find '{dump_path}'")
         sys.exit(1)
@@ -319,11 +319,8 @@ def extract_from_memory_dump(dump_path, extract_strings_flag=False, extract_file
         except Exception:
             start = idx + 4
 
-    if extract_strings_flag:
-        extract_strings(data, os.path.join(out_dir, "strings.txt"))
-
-    if extract_files_flag:
-        extract_zip_archives(data, out_dir)
+    extract_strings(data, os.path.join(out_dir, "strings.txt"))
+    extract_zip_archives(data, out_dir)
 
     print(f"\n[*] Finished! Successfully extracted {extracted_files} .pyc files and {extracted_pe} PE binaries to {out_dir}/")
     print(f"[*] You can now use decompyle3 or pycdc to decompile the extracted pyc files.")
@@ -332,8 +329,6 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="Extract PyInstaller assets from memory dumps")
     parser.add_argument("dump_file", help="Path to the memory dump (e.g. main.exe.dmp)")
-    parser.add_argument("--strings", action="store_true", help="Also extract human-readable strings to strings.txt")
-    parser.add_argument("--files", action="store_true", help="Also extract embedded common files (ZIP, SQLite, etc.)")
     
     args = parser.parse_args()
         
@@ -343,4 +338,4 @@ if __name__ == '__main__':
         print("[-] python-pefile is not installed. Please install it with 'pip install pefile'")
         sys.exit(1)
         
-    extract_from_memory_dump(args.dump_file, args.strings, args.files)
+    extract_from_memory_dump(args.dump_file)
