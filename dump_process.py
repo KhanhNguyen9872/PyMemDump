@@ -140,7 +140,12 @@ def main():
     # Check if target is a PID or a process name
     if target.isdigit():
         pid = int(target)
-        output_filename = f"process_{pid}.dmp"
+        try:
+            p = psutil.Process(pid)
+            process_name = p.name()
+            output_filename = f"{process_name}.dmp" if process_name else f"process_{pid}.dmp"
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError):
+            output_filename = f"process_{pid}.dmp"
     else:
         pid = get_pid_by_name(target)
         if pid is None:
