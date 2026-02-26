@@ -161,7 +161,11 @@ class WindowsDumper(ProcessDumper):
     def elevate_privileges(self):
         print("[*] Requesting Administrator privileges...")
         script = os.path.abspath(sys.argv[0])
-        params = ' '.join([f'"{script}"'] + sys.argv[1:])
+        # Replace the process name argument with the explicitly resolved PID
+        args = [sys.argv[i] for i in range(1, len(sys.argv)) if sys.argv[i] != self.target]
+        args.insert(0, str(self.pid))
+        params = ' '.join([f'"{script}"'] + args)
+        
         res = self.ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
         if res <= 32:
             print("[-] Failed to elevate privileges.")
@@ -209,8 +213,8 @@ class LinuxDumper(ProcessDumper):
 
     def elevate_privileges(self):
         print("[*] Requesting root privileges via sudo...")
-        args = ['sudo', sys.executable] + sys.argv
-        os.execvp('sudo', args)
+        args = [arg for arg in sys.argv if arg != self.target] + [str(self.pid)]
+        os.execvp('sudo', ['sudo', sys.executable] + args)
 
     def dump(self):
         try:
@@ -248,8 +252,8 @@ class TermuxDumper(LinuxDumper):
         for cmd in ['tsu', 'sudo']:
             if subprocess.run(['which', cmd], capture_output=True).returncode == 0:
                 print(f"[*] Requesting root privileges via {cmd}...")
-                args = [cmd, '-c', f"{sys.executable} " + " ".join(sys.argv)]
-                os.execvp(cmd, [cmd, '-c', f"{sys.executable} " + " ".join(sys.argv)])
+                args = [arg for arg in sys.argv if arg != self.target] + [str(self.pid)]
+                os.execvp(cmd, [cmd, '-c', f"{sys.executable} " + " ".join(args)])
         
         print("[-] Could not find 'tsu' or 'sudo' for elevation in Termux.")
         sys.exit(1)
