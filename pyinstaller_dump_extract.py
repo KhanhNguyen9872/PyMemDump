@@ -1,6 +1,8 @@
 import os
 import sys
 import zlib
+import bz2
+import lzma
 import marshal
 import shutil
 import hashlib
@@ -233,7 +235,7 @@ def extract_from_memory_dump(dump_path):
     extracted_names = set()
     extracted_hashes = set() # Store hashes to deduplicate identical modules
 
-    def process_code_object(obj, raw_bytes, idx, is_zlib=False):
+    def process_code_object(obj, raw_bytes, idx, is_zlib=False, comp_name="Zlib"):
         nonlocal extracted_files, extracted_names, extracted_hashes
         try:
             raw_filename = str(obj.co_filename)
@@ -249,7 +251,11 @@ def extract_from_memory_dump(dump_path):
         extracted_hashes.add(payload_hash)
 
         clean_filename = raw_filename.replace('\\', '/')
-        if '_MEI' in clean_filename:
+        if clean_filename.startswith('<frozen ') and clean_filename.endswith('>'):
+            # e.g '<frozen importlib._bootstrap>' -> 'importlib._bootstrap' -> 'importlib/_bootstrap.py'
+            module_name = clean_filename[8:-1]
+            rel_path = module_name.replace('.', '/') + '.py'
+        elif '_MEI' in clean_filename:
             parts = clean_filename.split('/')
             try:
                 mei_idx = next(i for i, part in enumerate(parts) if part.startswith('_MEI'))
@@ -279,45 +285,58 @@ def extract_from_memory_dump(dump_path):
             f.write(pyc_header)
             f.write(raw_bytes)
             
-        prefix = "Zlib Pyc" if is_zlib else "Raw Pyc"
+        prefix = f"{comp_name} Pyc" if is_zlib else "Raw Pyc"
         print(f"  [+] Extracted {prefix}: {raw_filename} -> {outname}")
         extracted_files += 1
 
-    print("\n[*] ----- Phase 1: Scanning for Zlib compressed Pyc Streams -----")
-    for zlib_hdr in [b'\x78\x9c', b'\x78\xda', b'\x78\x01']:
+    print("\n[*] ----- Phase 1: Scanning for Compressed Pyc Streams (ZLIB, GZIP, BZ2, LZMA) -----")
+    
+    # We define headers and their corresponding decompressor factory functions
+    compressors = [
+        (b'\x78\x9c', 'Zlib', lambda: zlib.decompressobj()),
+        (b'\x78\xda', 'Zlib', lambda: zlib.decompressobj()),
+        (b'\x78\x01', 'Zlib', lambda: zlib.decompressobj()),
+        (b'\x1f\x8b\x08', 'GZIP', lambda: zlib.decompressobj(wbits=31)),
+        (b'BZh', 'BZ2', lambda: bz2.BZ2Decompressor()),
+        (b'\xfd7zXZ\x00', 'LZMA', lambda: lzma.LZMADecompressor())
+    ]
+    
+    for magic_hdr, comp_name, decompressor_factory in compressors:
         start = 0
         while True:
-            idx = data.find(zlib_hdr, start)
+            idx = data.find(magic_hdr, start)
             if idx == -1:
                 break
                 
             try:
-                # Use decompressobj to handle trailing garbage gracefully without erroring out
-                d = zlib.decompressobj()
+                # Create a fresh decompressor object
+                d = decompressor_factory()
+                
+                # Decompress up to 16MB chunk
                 decompressed = d.decompress(data[idx:idx+16*1024*1024])
                 
-                # Check for Python < 3.12 marshal magic or Python >= 3.12 marshal magic
-                if decompressed.startswith(b'\xe3') or decompressed.startswith(b'c\x00\x00\x00'):
-                    try:
-                        obj = marshal.loads(decompressed)
-                        if type(obj).__name__ == 'code':
-                            process_code_object(obj, decompressed, idx, is_zlib=True)
-                    except Exception:
-                        pass
-                else:
-                    # PyInstaller sometimes embeds whole .pyc files (with 16-byte headers) in zlib streams
-                    if len(decompressed) > 16:
-                        magic = decompressed[:4]
-                        if magic in PYTHON_MAGICS.values():
-                            # It's a full .pyc file! Strip the 16 byte header to get the pure marshal code object
-                            try:
-                                obj = marshal.loads(decompressed[16:])
-                                if type(obj).__name__ == 'code':
-                                    process_code_object(obj, decompressed[16:], idx, is_zlib=True)
-                            except Exception:
-                                pass
+                if decompressed:
+                    # Check for Python < 3.12 marshal magic or Python >= 3.12 marshal magic
+                    if decompressed.startswith(b'\xe3') or decompressed.startswith(b'c\x00\x00\x00'):
+                        try:
+                            obj = marshal.loads(decompressed)
+                            if type(obj).__name__ == 'code':
+                                process_code_object(obj, decompressed, idx, is_zlib=True, comp_name=comp_name)
+                        except Exception:
+                            pass
+                    else:
+                        # PyInstaller sometimes embeds whole .pyc files (with 16-byte headers)
+                        if len(decompressed) > 16:
+                            magic = decompressed[:4]
+                            if magic in PYTHON_MAGICS.values():
+                                try:
+                                    obj = marshal.loads(decompressed[16:])
+                                    if type(obj).__name__ == 'code':
+                                        process_code_object(obj, decompressed[16:], idx, is_zlib=True, comp_name=comp_name)
+                                except Exception:
+                                    pass
                             
-            except Exception: # Catch zlib and marshal errors
+            except Exception: # Catch zlib, bz2, lzma, and marshal errors
                 pass
             
             start = idx + 1
