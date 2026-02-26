@@ -489,11 +489,26 @@ def extract_from_memory_dump(dump_path):
                 base, ext = os.path.splitext(original_dll_name)
                 pe_outpath = os.path.join(out_dir, f"{base}_{idx:X}{ext}")
                 
+            type_str = "PYD Extension" if is_pyd else "PE Binary"
+            print(f"  [+] Extracted {'PYD Extension' if is_pyd else 'PE Binary'}: {original_dll_name} (Size: {size_of_image / 1024:.1f} KB)")
+            
+            # Apply PE Header Unmapping before saving
+            try:
+                # The extracted bytes are in Memory Layout (Virtual Address)
+                # We need to unmap them to Disk Layout (Raw Offset) so analysis tools can read them
+                for section in pe.sections:
+                    section.PointerToRawData = section.VirtualAddress
+                    section.SizeOfRawData = max(section.Misc_VirtualSize, section.SizeOfRawData)
+                # Ensure Windows loader/IDA knows the file alignment constraint
+                pe.OPTIONAL_HEADER.FileAlignment = pe.OPTIONAL_HEADER.SectionAlignment
+                pe_data = pe.write()
+            except Exception as e:
+                # If unmapping fails, fallback to raw memory dump write
+                pass
+                
             with open(pe_outpath, 'wb') as f:
                 f.write(pe_data)
-                
-            type_str = "PYD Extension" if is_pyd else "PE Binary"
-            print(f"  [+] Extracted {type_str}: {original_dll_name} (Size: {size_of_image/1024:.1f} KB)")
+            
             extracted_pe += 1
             
             start = idx + size_of_image
