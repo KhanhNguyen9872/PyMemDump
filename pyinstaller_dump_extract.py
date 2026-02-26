@@ -233,10 +233,35 @@ def extract_from_memory_dump(dump_path):
 
     extracted_files = 0
     extracted_names = set()
-    extracted_hashes = set() # Store hashes to deduplicate identical modules
+    
+    # Store hashes and code object signatures to deduplicate identical modules
+    extracted_hashes = set()
+    extracted_code_signatures = {} # outname -> signature hash
+
+    def get_code_signature(obj):
+        """Creates a deterministic hash of the critical parts of a python code object"""
+        hasher = hashlib.md5()
+        for attr in ['co_argcount', 'co_posonlyargcount', 'co_kwonlyargcount', 
+                     'co_nlocals', 'co_stacksize', 'co_flags', 'co_code', 
+                     'co_consts', 'co_names', 'co_varnames', 'co_freevars', 'co_cellvars']:
+            val = getattr(obj, attr, None)
+            if val is not None:
+                if attr == 'co_consts':
+                    # co_consts can contain nested code objects, which evaluate to <code object at 0x...> string
+                    # This memory address changes per load! We must hash nested code objects recursively.
+                    consts_repr = []
+                    for c in val:
+                        if type(c).__name__ == 'code':
+                            consts_repr.append(get_code_signature(c).hex())
+                        else:
+                            consts_repr.append(repr(c))
+                    hasher.update(str(consts_repr).encode('utf-8', 'ignore'))
+                else:
+                    hasher.update(str(val).encode('utf-8', 'ignore'))
+        return hasher.digest()
 
     def process_code_object(obj, raw_bytes, idx, is_zlib=False, comp_name="Zlib"):
-        nonlocal extracted_files, extracted_names, extracted_hashes
+        nonlocal extracted_files, extracted_names, extracted_hashes, extracted_code_signatures
         try:
             raw_filename = str(obj.co_filename)
         except AttributeError:
@@ -271,12 +296,23 @@ def extract_from_memory_dump(dump_path):
             rel_path = f"unknown_module_{idx:X}.py"
 
         rel_path_c = rel_path + "c"
-        
         outname = rel_path_c
+        
+        # Calculate a signature for this specific code object
+        sig = get_code_signature(obj)
+        
+        # If a file with this name already exists, check if it's the exact same code
         if outname in extracted_names:
-            base, ext = os.path.splitext(rel_path)
-            outname = f"{base}_{idx:X}.pyc"
+            if extracted_code_signatures.get(outname) == sig:
+                # Code is identical (probably just 0-pad/metadata differences), skip extracting duplicate
+                return
+            else:
+                # Code is different but same name (e.g two different scripts with same name), write with hex suffix
+                base, ext = os.path.splitext(rel_path)
+                outname = f"{base}_{idx:X}.pyc"
+                
         extracted_names.add(outname)
+        extracted_code_signatures[outname] = sig
 
         outpath = os.path.join(out_dir, outname)
         os.makedirs(os.path.dirname(outpath), exist_ok=True)
@@ -373,6 +409,8 @@ def extract_from_memory_dump(dump_path):
             pe = pefile.PE(data=slice_data, fast_load=True)
             
             original_dll_name = f"embedded_{idx:X}.dll"
+            is_pyd = False
+            
             try:
                 pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT']])
                 if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
@@ -380,11 +418,29 @@ def extract_from_memory_dump(dump_path):
                     name_bytes = pe.get_string_at_rva(name_ord)
                     if name_bytes:
                         original_dll_name = name_bytes.decode('utf-8', 'ignore')
+                        if original_dll_name.endswith('.pyd'):
+                            is_pyd = True
             except Exception:
                 pass
                 
             size_of_image = pe.OPTIONAL_HEADER.SizeOfImage
             pe_data = slice_data[:size_of_image]
+            
+            # Heuristic detection for Python C-Extensions (Cython / PyInstaller modules)
+            if original_dll_name.startswith("embedded_"):
+                # Search the PE binary for strings ending in .pyx or .py
+                matches = set(re.findall(b'([a-zA-Z_][a-zA-Z0-9_]*)\\.(?:pyx|py)', pe_data))
+                if matches:
+                    is_pyd = True
+                    # Take the longest match or the first match as the module name
+                    best_match = max(matches, key=len).decode('utf-8', 'ignore')
+                    original_dll_name = f"{best_match}.pyd"
+                elif b'PyInit_' in pe_data or b'cython' in pe_data.lower() or b'pybind11' in pe_data.lower():
+                    is_pyd = True
+                    original_dll_name = f"embedded_python_extension_{idx:X}.pyd"
+            
+            if is_pyd and original_dll_name.endswith('.dll'):
+                original_dll_name = original_dll_name[:-4] + '.pyd'
             
             pe_outpath = os.path.join(out_dir, original_dll_name)
             
@@ -395,7 +451,8 @@ def extract_from_memory_dump(dump_path):
             with open(pe_outpath, 'wb') as f:
                 f.write(pe_data)
                 
-            print(f"  [+] Extracted PE Binary: {original_dll_name} (Size: {size_of_image/1024:.1f} KB)")
+            type_str = "PYD Extension" if is_pyd else "PE Binary"
+            print(f"  [+] Extracted {type_str}: {original_dll_name} (Size: {size_of_image/1024:.1f} KB)")
             extracted_pe += 1
             
             start = idx + size_of_image
