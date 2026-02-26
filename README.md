@@ -55,10 +55,12 @@ python main.py target_app.exe.dmp
 
 **Features:**
 - Universal memory extraction for Python versions **3.9 through 3.15**.
+- Works out-of-the-box with **PyInstaller** and **PyArmor (v7 or below)**.
 - Extracts compiled bytecode (`.pyc`), binary extensions (`.pyd`), and shared libraries (`.dll`).
 - Automatically creates and organizes outputs within an extracted directory.
 - Deduplicates payload carving to provide you the cleanest application source possible.
-- Agnostic to the packaging tool (works for PyInstaller, Py2exe, Nuitka-packaged resources, custom Cython loaders, etc.).
+- Agnostic to the packaging tool: **any application or protector that dynamically loads a `.pyc` or Python code object into RAM can be dumped and extracted**.
+- **Nuitka Support:** Can dump loaded resources and libraries from Nuitka-compiled executables (extracts `.pyc` of libraries as long as they were not explicitly compiled/translated into Cython/C extensions).
 
 ---
 
