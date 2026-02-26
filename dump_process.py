@@ -51,63 +51,79 @@ def get_pid_by_name(process_name):
 
 def create_memory_dump(pid, output_filename):
     """Creates a full memory dump of the target process using Windows dbghelp API."""
-    # Open the process with required privileges
-    process_handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
-    
-    if not process_handle:
-        print(f"[-] Failed to open process PID {pid}. Ensure the target process is running.")
-        return False
+    p_obj = None
+    try:
+        p_obj = psutil.Process(pid)
+        p_obj.suspend()
+        print(f"[*] Suspended process {pid}.")
+    except Exception as e:
+        print(f"[-] Failed to suspend process {pid}: {e}")
+
+    try:
+        # Open the process with required privileges
+        process_handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
         
-    print(f"[*] Opened process {pid} successfully.")
-    
-    # Windows CreateFile Constants
-    GENERIC_WRITE = 0x40000000
-    CREATE_ALWAYS = 2
-    FILE_ATTRIBUTE_NORMAL = 0x80
-    
-    # Open file handle for writing the dump
-    file_handle = kernel32.CreateFileW(
-        output_filename,
-        GENERIC_WRITE,
-        0,
-        None,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        None
-    )
-    
-    if file_handle == -1: # INVALID_HANDLE_VALUE
-        print(f"[-] Failed to create output file: {output_filename}")
+        if not process_handle:
+            print(f"[-] Failed to open process PID {pid}. Ensure the target process is running.")
+            return False
+            
+        print(f"[*] Opened process {pid} successfully.")
+        
+        # Windows CreateFile Constants
+        GENERIC_WRITE = 0x40000000
+        CREATE_ALWAYS = 2
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        
+        # Open file handle for writing the dump
+        file_handle = kernel32.CreateFileW(
+            output_filename,
+            GENERIC_WRITE,
+            0,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None
+        )
+        
+        if file_handle == -1: # INVALID_HANDLE_VALUE
+            print(f"[-] Failed to create output file: {output_filename}")
+            kernel32.CloseHandle(process_handle)
+            return False
+            
+        print(f"[*] Writing full memory dump to {output_filename}...")
+        print(f"[*] Please wait, this may take a moment and produce a large file...")
+        
+        # Invoke MiniDumpWriteDump from dbghelp.dll
+        success = dbghelp.MiniDumpWriteDump(
+            process_handle,
+            pid,
+            file_handle,
+            MINIDUMP_WITH_FULL_MEMORY,
+            None,
+            None,
+            None
+        )
+        
+        # Clean up handles
+        kernel32.CloseHandle(file_handle)
         kernel32.CloseHandle(process_handle)
-        return False
         
-    print(f"[*] Writing full memory dump to {output_filename}...")
-    print(f"[*] Please wait, this may take a moment and produce a large file...")
-    
-    # Invoke MiniDumpWriteDump from dbghelp.dll
-    success = dbghelp.MiniDumpWriteDump(
-        process_handle,
-        pid,
-        file_handle,
-        MINIDUMP_WITH_FULL_MEMORY,
-        None,
-        None,
-        None
-    )
-    
-    # Clean up handles
-    kernel32.CloseHandle(file_handle)
-    kernel32.CloseHandle(process_handle)
-    
-    if success:
-        dump_size = os.path.getsize(output_filename) / (1024 * 1024)
-        print(f"[+] Success! Dump created: {output_filename} ({dump_size:.2f} MB)")
-        input("Press Enter to exit...")  # Keeps the new admin window open so the user can read the result
-        return True
-    else:
-        print(f"[-] Memory dump failed. Error Code: {kernel32.GetLastError()}")
-        input("Press Enter to exit...")
-        return False
+        if success:
+            dump_size = os.path.getsize(output_filename) / (1024 * 1024)
+            print(f"[+] Success! Dump created: {output_filename} ({dump_size:.2f} MB)")
+            input("Press Enter to exit...")  # Keeps the new admin window open so the user can read the result
+            return True
+        else:
+            print(f"[-] Memory dump failed. Error Code: {kernel32.GetLastError()}")
+            input("Press Enter to exit...")
+            return False
+    finally:
+        if p_obj:
+            try:
+                p_obj.resume()
+                print(f"[*] Resumed process {pid}.")
+            except Exception as e:
+                print(f"[-] Failed to resume process {pid}: {e}")
 
 def main():
     if len(sys.argv) < 2:
