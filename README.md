@@ -67,11 +67,17 @@ python main.py target_app.exe.dmp
 **Q: Why do static extraction tools (like pyinstxtractor) find 100+ files on disk, but this memory extractor only finds a fraction of them? Am I missing code?**
 
 **A:** No, you are not missing any active application code! 
-When tools like PyInstaller create an executable on disk, they bundle hundreds of standard libraries "just in case" the app needs them. However, Python dynamically loads only what it actually executes. In a **Memory Dump**, the only Code objects that actively decompress into RAM are the modules that your executable *actually imported and utilized*. This acts as the ultimate filter—extracting only the core application logic (e.g., `main.pyc`) and omitting standard library bloat.
+When tools like PyInstaller create an executable on disk, they bundle hundreds of standard libraries "just in case" the app needs them. However, Python dynamically loads only what it actually executes. In a **Memory Dump**, the only Code objects that actively decompress into RAM are the modules that your executable *actually imported and utilized at the exact moment the dump was taken*. 
+This means the tool will **only extract `.pyc` / `<code object>` files that the program has actively loaded into memory**. This acts as the ultimate filter—extracting only the core application logic (e.g., `main.pyc`) and omitting standard library bloat. If a certain feature or module wasn't triggered before you dumped the process, its code might not be extracted.
 
 **Q: How do I read the `.pyc` files?**
 
 **A:** You will need a Python Bytecode Decompiler matching the extracted version (often visible in the terminal output, e.g., Python 3.13):
-- Use `decompyle3` (For older versions <= 3.8)
-- Use `pycdc` (C++ Decompiler, supports Python 3.9 -> 3.15)
-- Use standard `dis.dis()` logic in Python to read the low-level interpreter ops.
+- Use **pylingual.io** (Web-based decompiler, highly recommended for modern Python).
+- Use `pycdc` (C++ Decompiler, supports Python 3.9 -> 3.15).
+- Output the low-level interpreter ops using standard `dis.dis()` in Python, and feed the disassembly to an AI like **Gemini, Claude, or ChatGPT** to help reconstruct the source code.
+- Use `decompyle3` (For older versions <= 3.8).
+
+**Q: Why can't I directly `import` the extracted `.pyd` or `.dll` files in a new Python script?**
+
+**A:** Because these binaries were dumped directly from the process memory (heap/RAM) while they were already loaded and executing. As a result, they may lack their pristine original PE headers, correct section alignments on disk, and other essential characteristics of a fully-formed file. The Windows OS loader will likely refuse to load them normally. You should only use these memory-dumped `.pyd` and `.dll` files for static reverse-engineering and analysis inside tools like **IDA Pro**, **Ghidra**, or **Binary Ninja**.
