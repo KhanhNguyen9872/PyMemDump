@@ -11,16 +11,15 @@ import re
 import struct
 
 # Magic numbers for Python 3.9 - 3.15
-# Format: bytes magic + \r\n
-# padding/timestamp/size depends on Python version (usually 16 bytes total for Python 3.7+)
+# Format: bytes magic + \x0d\x0d\x0a
 PYTHON_MAGICS = {
-    '3.9': b'\x61\x0d\r\n',
-    '3.10': b'\x6f\x0d\r\n',
-    '3.11': b'\xa7\x0d\r\n',
-    '3.12': b'\xcb\x0d\r\n',
-    '3.13': b'\xf3\x0d\r\n',
-    '3.14': b'\x2b\x0e\r\n',
-    '3.15': b'\x4c\x0e\r\n'
+    '3.9': b'\x61\x0d\x0d\x0a',
+    '3.10': b'\x6f\x0d\x0d\x0a',
+    '3.11': b'\xa7\x0d\x0d\x0a',
+    '3.12': b'\xcb\x0d\x0d\x0a',
+    '3.13': b'\xf3\x0d\x0d\x0a',
+    '3.14': b'\x2b\x0e\x0d\x0a',
+    '3.15': b'\x4c\x0e\x0d\x0a'
 }
 
 def build_pyc_header(magic_bytes, py_ver):
@@ -200,35 +199,54 @@ def extract_from_memory_dump(dump_path):
         print(f"[-] Error reading file: {e}")
         return
 
-    # Detect Python version by looking for the DLL string
-    py_ver = '3.13' # Default fallback
-    magic_bytes = PYTHON_MAGICS[py_ver]
+    # Priority 1: Try to detect via PythonXX.dll (Windows) or libpython3.X.so (Linux)
+    match_dll = re.search(br'(?i)python3(\d+)\.dll', data)
+    match_so = re.search(br'(?i)libpython3\.(\d+)\.so', data)
     
-    # Try to detect via PythonXX.dll
-    match = re.search(br'(?i)python3(\d+)\.dll', data)
-    if match:
-        minor = int(match.group(1).decode('ascii'))
+    detected_version = None
+    if match_dll:
+        minor = int(match_dll.group(1).decode('ascii'))
         detected_version = f"3.{minor}"
-        if detected_version in PYTHON_MAGICS:
-            py_ver = detected_version
-            magic_bytes = PYTHON_MAGICS[py_ver]
-            print(f"[+] Detected Python Version: {py_ver} from python3{minor}.dll")
+        print(f"[+] Detected Python Version: {detected_version} from python3{minor}.dll")
+    elif match_so:
+        minor = int(match_so.group(1).decode('ascii'))
+        detected_version = f"3.{minor}"
+        print(f"[+] Detected Python Version: {detected_version} from libpython3.{minor}.so")
+
+    if detected_version and detected_version in PYTHON_MAGICS:
+        py_ver = detected_version
+        magic_bytes = PYTHON_MAGICS[py_ver]
     else:
-        # Fallback to search for known magic headers in the dump
+        # Priority 2: Search for known magic headers in the dump
+        # We prioritize the running version of Python to avoid false positives with older versions
+        current_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        found_versions = []
         for version, magic in PYTHON_MAGICS.items():
             if data.find(magic) != -1:
-                py_ver = version
-                magic_bytes = magic
-                print(f"[+] Detected Python Version: {py_ver} from magic byte signature")
-                break
+                found_versions.append(version)
+        
+        if found_versions:
+            if current_ver in found_versions:
+                py_ver = current_ver
+            else:
+                # If current version is not found, take the highest found version (likely the target)
+                py_ver = sorted(found_versions, key=lambda v: [int(x) for x in v.split('.')])[-1]
+            
+            magic_bytes = PYTHON_MAGICS[py_ver]
+            print(f"[+] Detected Python Version: {py_ver} from magic byte signature (candidates: {', '.join(found_versions)})")
+        else:
+            print("[!] Could not detect Python version automatically. Falling back to 3.12")
+            py_ver = '3.12'
+            magic_bytes = PYTHON_MAGICS[py_ver]
 
     print(f"[*] Using Pyc Header for Python {py_ver}")
     pyc_header = build_pyc_header(magic_bytes, py_ver)
 
     # marshal is strictly minor-version dependent
-    current_ver = f"3.{sys.version_info.minor}"
+    current_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
     if current_ver != py_ver:
         print(f"[-] VERSION MISMATCH: Dump contains Python {py_ver} but script is running with Python {current_ver}!")
+        print(f"[*] Please run the extraction script with Python {py_ver} to match the target.")
         sys.exit(1)
 
     extracted_files = 0
