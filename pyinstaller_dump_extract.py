@@ -292,36 +292,54 @@ def extract_from_memory_dump(dump_path):
                 break
                 
             try:
-                decompressed = zlib.decompress(data[idx:idx+16*1024*1024])
-                if decompressed.startswith(b'\xe3'):
+                # Use decompressobj to handle trailing garbage gracefully without erroring out
+                d = zlib.decompressobj()
+                decompressed = d.decompress(data[idx:idx+16*1024*1024])
+                
+                # Check for Python < 3.12 marshal magic or Python >= 3.12 marshal magic
+                if decompressed.startswith(b'\xe3') or decompressed.startswith(b'c\x00\x00\x00'):
                     try:
                         obj = marshal.loads(decompressed)
                         if type(obj).__name__ == 'code':
                             process_code_object(obj, decompressed, idx, is_zlib=True)
                     except Exception:
                         pass
-            except zlib.error:
+                else:
+                    # PyInstaller sometimes embeds whole .pyc files (with 16-byte headers) in zlib streams
+                    if len(decompressed) > 16:
+                        magic = decompressed[:4]
+                        if magic in PYTHON_MAGICS.values():
+                            # It's a full .pyc file! Strip the 16 byte header to get the pure marshal code object
+                            try:
+                                obj = marshal.loads(decompressed[16:])
+                                if type(obj).__name__ == 'code':
+                                    process_code_object(obj, decompressed[16:], idx, is_zlib=True)
+                            except Exception:
+                                pass
+                            
+            except Exception: # Catch zlib and marshal errors
                 pass
             
             start = idx + 1
 
     print("\n[*] ----- Phase 2: Scanning for Uncompressed PyCode Objects -----")
-    start = 0
-    search_pattern = b'\xe3\x00\x00\x00\x00'
-    while True:
-        idx = data.find(search_pattern, start)
-        if idx == -1:
-            break
-        
-        try:
-            chunk = data[idx:idx+8*1024*1024]
-            obj = marshal.loads(chunk)
-            if type(obj).__name__ == 'code':
-                process_code_object(obj, marshal.dumps(obj), idx, is_zlib=False)
-        except Exception:
-            pass
-        
-        start = idx + 1
+    for search_pattern in [b'\xe3\x00\x00\x00\x00', b'c\x00\x00\x00\x00\x00\x00\x00\x00']:
+        start = 0
+        while True:
+            idx = data.find(search_pattern, start)
+            if idx == -1:
+                break
+            
+            try:
+                chunk = data[idx:idx+8*1024*1024]
+                obj = marshal.loads(chunk)
+                if type(obj).__name__ == 'code':
+                    # For Python 3.12 marshal, we need to correctly reserialize it
+                    process_code_object(obj, marshal.dumps(obj), idx, is_zlib=False)
+            except Exception:
+                pass
+            
+            start = idx + 1
 
     print("\n[*] ----- Phase 3: Extracting Embedded PE Binaries (DLL / PYD) -----")
     start = 0
