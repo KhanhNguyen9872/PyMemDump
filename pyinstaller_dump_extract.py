@@ -412,7 +412,11 @@ def extract_from_memory_dump(dump_path):
             is_pyd = False
             
             try:
-                pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT']])
+                # We use fast_load for speed, so we must manually parse EXPORT and RESOURCE dirs
+                pe.parse_data_directories(directories=[
+                    pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
+                    pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']
+                ])
                 if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
                     name_ord = pe.DIRECTORY_ENTRY_EXPORT.struct.Name
                     name_bytes = pe.get_string_at_rva(name_ord)
@@ -426,8 +430,45 @@ def extract_from_memory_dump(dump_path):
             size_of_image = pe.OPTIONAL_HEADER.SizeOfImage
             pe_data = slice_data[:size_of_image]
             
-            # Heuristic detection for Python C-Extensions (Cython / PyInstaller modules)
+            # Heuristic detection for generic missing DLL names
             if original_dll_name.startswith("embedded_"):
+                # 0. Try to extract name from StringFileInfo Version Info
+                try:
+                    for fileinfo in pe.FileInfo:
+                        for d in fileinfo:
+                            if d.name == 'StringFileInfo':
+                                for st in d.StringTable:
+                                    orig_name = st.entries.get(b'OriginalFilename', b'').decode('utf-8', 'ignore')
+                                    internal_name = st.entries.get(b'InternalName', b'').decode('utf-8', 'ignore')
+                                    
+                                    name_cand = None
+                                    if internal_name and '.dll' in internal_name.lower():
+                                        name_cand = internal_name
+                                    elif orig_name and '.dll' in orig_name.lower():
+                                        name_cand = orig_name
+                                        
+                                    if name_cand:
+                                        if name_cand.lower().endswith('.mui'):
+                                            name_cand = name_cand[:-4]
+                                        original_dll_name = name_cand
+                                        break
+                except Exception:
+                    pass
+                
+            if original_dll_name.startswith("embedded_"):
+                # 1. Try to find a PDB debug string path (e.g C:\\...\\vcruntime140.amd64.pdb)
+                pdb_path = re.search(b'([a-zA-Z0-9_\\-\\.]+)\\.pdb', pe_data, re.IGNORECASE)
+                if pdb_path:
+                    guessed_name = pdb_path.group(1).decode('utf-8', 'ignore') + '.dll'
+                    original_dll_name = guessed_name
+                else:
+                    # 2. Try to find the first string that looks like a .dll name
+                    dll_name = re.search(b'([a-zA-Z0-9_\\-\\.]+)\\.dll', pe_data, re.IGNORECASE)
+                    if dll_name:
+                        original_dll_name = dll_name.group()[:64].decode('utf-8', 'ignore')
+            
+            # Heuristic detection for Python C-Extensions (Cython / PyInstaller modules)
+            if original_dll_name.startswith("embedded_") or original_dll_name.endswith(".dll"):
                 # Search the PE binary for strings ending in .pyx or .py
                 matches = set(re.findall(b'([a-zA-Z_][a-zA-Z0-9_]*)\\.(?:pyx|py)', pe_data))
                 if matches:
