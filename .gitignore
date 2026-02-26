@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.env
+.venv
+
+# IDE / Editor configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Project specific: Memory Dumps, Target Executables, and Extracted Output
+*.dmp
+*_extracted/
+*.exe
+*.dll
+*.pyd
+*.sqlite
+*.pyz
+strings.txt
