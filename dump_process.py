@@ -1,161 +1,295 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
-import ctypes
-import psutil
+import subprocess
+import platform
 
-# Windows API Constants
-PROCESS_QUERY_INFORMATION = 0x0400
-PROCESS_VM_READ = 0x0010
-MINIDUMP_WITH_FULL_MEMORY = 0x00000002
-
-# Load Windows DLLs
-dbghelp = ctypes.windll.dbghelp
-kernel32 = ctypes.windll.kernel32
-
-def is_admin():
-    """Returns True if the script is running with Administrator privileges."""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception:
-        return False
-
-def run_as_admin():
-    """Relaunches the current script with Administrator privileges using Windows UAC."""
-    print("[*] Requesting Administrator privileges...")
+# Ensure psutil is installed
+def install_psutil():
+    print("[*] psutil is not installed. Attempting to install...")
+    os_name = platform.system()
     
-    # sys.executable is the path to python.exe
-    # sys.argv contains the script path and its arguments
-    script = os.path.abspath(sys.argv[0])
-    params = ' '.join([script] + sys.argv[1:])
-    
-    # 1 specifies SW_SHOWNORMAL
-    res = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-    
-    if res <= 32:
-        print("[-] Failed to elevate privileges or user cancelled the UAC prompt.")
-        sys.exit(1)
-    
-    # If successful, this original unprivileged process can just exit, 
-    # since the new elevated window is taking over.
-    sys.exit(0)
-
-def get_pid_by_name(process_name):
-    """Finds a running process ID by its executable name."""
-    for proc in psutil.process_iter(['pid', 'name']):
+    def try_pip():
         try:
-            if proc.info['name'] and proc.info['name'].lower() == process_name.lower():
-                return proc.info['pid']
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            pass
-    return None
-
-def create_memory_dump(pid, output_filename):
-    """Creates a full memory dump of the target process using Windows dbghelp API."""
-    p_obj = None
-    try:
-        p_obj = psutil.Process(pid)
-        p_obj.suspend()
-        print(f"[*] Suspended process {pid}.")
-    except Exception as e:
-        print(f"[-] Failed to suspend process {pid}: {e}")
-
-    try:
-        # Open the process with required privileges
-        process_handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
-        
-        if not process_handle:
-            print(f"[-] Failed to open process PID {pid}. Ensure the target process is running.")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil", "--break-system-packages"])
+            return True
+        except Exception:
             return False
-            
-        print(f"[*] Opened process {pid} successfully.")
+
+    if try_pip(): return True
+
+    # If pip fails and we are on Linux/Termux, try to install pip or system package
+    if os_name == "Linux":
+        is_termux = "TERMUX_VERSION" in os.environ or os.path.exists("/data/data/com.termux")
         
-        # Windows CreateFile Constants
+        if is_termux:
+            print("[*] Termux detected. Ensuring pip and build tools...")
+            try:
+                # In Termux, pip is usually in the 'python' package
+                subprocess.check_call(["pkg", "install", "python", "-y"])
+                if try_pip(): return True
+                
+                # If pip install still fails, psutil might need compilation
+                print("[*] psutil might need compilation. Installing build tools...")
+                subprocess.check_call(["pkg", "install", "python3-pip", "python3-dev", "clang", "make", "binutils", "-y"])
+                if try_pip(): return True
+                
+                # Last resort: try pkg package if it works now
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
+                return True
+            except Exception:
+                pass
+        else:
+            # General Linux
+            print("[*] Linux detected. Attempting to install pip/psutil via apt...")
+            try:
+                subprocess.check_call(["sudo", "apt", "update", "-y"])
+                # Try to install pip first
+                subprocess.check_call(["sudo", "apt", "install", "python3-pip", "-y"])
+                if try_pip(): return True
+                
+                # Try system package as fallback
+                subprocess.check_call(["sudo", "apt", "install", "python3-psutil", "-y"])
+                return True
+            except Exception:
+                pass
+
+    return False
+
+try:
+    import psutil
+except ImportError:
+    if install_psutil():
+        try:
+            import psutil
+            print("[+] psutil installed successfully.")
+        except ImportError:
+            print("[-] psutil installed but still cannot be imported.")
+            sys.exit(1)
+    else:
+        print("[-] Failed to install psutil automatically.")
+        print("[!] Please install psutil manually: \n    - Windows: pip install psutil\n    - Linux: sudo apt install python3-psutil\n    - Termux: pkg install python-psutil")
+        sys.exit(1)
+
+class ProcessDumper:
+    def __init__(self, target):
+        self.target = target
+        self.pid = self._resolve_pid(target)
+        self.process_name = self._get_process_name()
+        self.output_filename = f"{self.process_name or 'process'}_{self.pid}.dmp"
+
+    def _resolve_pid(self, target):
+        if target.isdigit():
+            return int(target)
+        
+        matches = []
+        current_pid = os.getpid()
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if proc.info['pid'] == current_pid:
+                    continue
+                if proc.info['name'] and proc.info['name'].lower() == target.lower():
+                    matches.append(proc.info)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        
+        if not matches:
+            print(f"[-] Could not find any running process named '{target}'.")
+            sys.exit(1)
+        
+        if len(matches) == 1:
+            return matches[0]['pid']
+        
+        print(f"[*] Found {len(matches)} processes matching '{target}':")
+        for i, proc in enumerate(matches):
+            try:
+                # Try to get more info if possible
+                p = psutil.Process(proc['pid'])
+                create_time = p.create_time()
+                import datetime
+                time_str = datetime.datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"  {i+1}. PID: {proc['pid']} (Started: {time_str})")
+            except:
+                print(f"  {i+1}. PID: {proc['pid']}")
+        
+        while True:
+            choice = input(f"[?] Select PID to dump (or enter PID directly): ").strip()
+            if choice.isdigit():
+                choice_int = int(choice)
+                # Check if it was an index
+                if 1 <= choice_int <= len(matches):
+                    return matches[choice_int - 1]['pid']
+                # Or if it's one of the PIDs shown
+                if any(m['pid'] == choice_int for m in matches):
+                    return choice_int
+                # Or maybe it's a PID not in matches but user knows what they are doing? 
+                # Better to just allow any valid numeric input if they insist, 
+                # but let's stick to the list or direct PID for now.
+                print(f"[*] Proceeding with PID {choice_int}...")
+                return choice_int
+            print("[-] Invalid input. Please enter a number from the list or a PID.")
+
+    def _get_process_name(self):
+        try:
+            return psutil.Process(self.pid).name()
+        except:
+            return None
+
+    def is_privileged(self):
+        raise NotImplementedError
+
+    def elevate_privileges(self):
+        raise NotImplementedError
+
+    def dump(self):
+        raise NotImplementedError
+
+class WindowsDumper(ProcessDumper):
+    def __init__(self, target):
+        import ctypes
+        self.ctypes = ctypes
+        self.kernel32 = ctypes.windll.kernel32
+        self.dbghelp = ctypes.windll.dbghelp
+        super().__init__(target)
+
+    def is_privileged(self):
+        try:
+            return self.ctypes.windll.shell32.IsUserAnAdmin()
+        except:
+            return False
+
+    def elevate_privileges(self):
+        print("[*] Requesting Administrator privileges...")
+        script = os.path.abspath(sys.argv[0])
+        params = ' '.join([f'"{script}"'] + sys.argv[1:])
+        res = self.ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        if res <= 32:
+            print("[-] Failed to elevate privileges.")
+            sys.exit(1)
+        sys.exit(0)
+
+    def dump(self):
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ = 0x0010
+        MINIDUMP_WITH_FULL_MEMORY = 0x00000002
         GENERIC_WRITE = 0x40000000
         CREATE_ALWAYS = 2
         FILE_ATTRIBUTE_NORMAL = 0x80
-        
-        # Open file handle for writing the dump
-        file_handle = kernel32.CreateFileW(
-            output_filename,
-            GENERIC_WRITE,
-            0,
-            None,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            None
-        )
-        
-        if file_handle == -1: # INVALID_HANDLE_VALUE
-            print(f"[-] Failed to create output file: {output_filename}")
-            kernel32.CloseHandle(process_handle)
-            return False
+
+        p_obj = psutil.Process(self.pid)
+        try:
+            p_obj.suspend()
+            h_proc = self.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, self.pid)
+            if not h_proc:
+                print(f"[-] Failed to open process PID {self.pid}.")
+                return False
+
+            h_file = self.kernel32.CreateFileW(self.output_filename, GENERIC_WRITE, 0, None, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, None)
+            if h_file == -1:
+                print(f"[-] Failed to create output file: {self.output_filename}")
+                self.kernel32.CloseHandle(h_proc)
+                return False
+
+            print(f"[*] Dumping memory to {self.output_filename}...")
+            success = self.dbghelp.MiniDumpWriteDump(h_proc, self.pid, h_file, MINIDUMP_WITH_FULL_MEMORY, None, None, None)
             
-        print(f"[*] Writing full memory dump to {output_filename}...")
-        print(f"[*] Please wait, this may take a moment and produce a large file...")
-        
-        # Invoke MiniDumpWriteDump from dbghelp.dll
-        success = dbghelp.MiniDumpWriteDump(
-            process_handle,
-            pid,
-            file_handle,
-            MINIDUMP_WITH_FULL_MEMORY,
-            None,
-            None,
-            None
-        )
-        
-        # Clean up handles
-        kernel32.CloseHandle(file_handle)
-        kernel32.CloseHandle(process_handle)
-        
-        if success:
-            dump_size = os.path.getsize(output_filename) / (1024 * 1024)
-            print(f"[+] Success! Dump created: {output_filename} ({dump_size:.2f} MB)")
-            input("Press Enter to exit...")  # Keeps the new admin window open so the user can read the result
+            self.kernel32.CloseHandle(h_file)
+            self.kernel32.CloseHandle(h_proc)
+
+            if success:
+                print(f"[+] Success! Dump created: {self.output_filename} ({os.path.getsize(self.output_filename)/(1024*1024):.2f} MB)")
+                return True
+        finally:
+            p_obj.resume()
+        return False
+
+class LinuxDumper(ProcessDumper):
+    def is_privileged(self):
+        return os.getuid() == 0
+
+    def elevate_privileges(self):
+        print("[*] Requesting root privileges via sudo...")
+        args = ['sudo', sys.executable] + sys.argv
+        os.execvp('sudo', args)
+
+    def dump(self):
+        try:
+            print(f"[*] Dumping memory for PID {self.pid} via procfs...")
+            with open(f"/proc/{self.pid}/maps", "r") as maps_file:
+                with open(f"/proc/{self.pid}/mem", "rb", 0) as mem_file:
+                    with open(self.output_filename, "wb") as dump_file:
+                        for line in maps_file:
+                            parts = line.split()
+                            if not parts: continue
+                            addr_range = parts[0]
+                            start, end = [int(x, 16) for x in addr_range.split("-")]
+                            
+                            # Skip special regions if needed, but for full dump we try all
+                            try:
+                                mem_file.seek(start)
+                                chunk = mem_file.read(end - start)
+                                dump_file.write(chunk)
+                            except Exception:
+                                # Some regions might not be readable even as root (e.g. vsyscall)
+                                # We pad with zeros to keep the dump alignment if we want a "raw" dump
+                                # but usually we just skip or use a structured format like ELF core.
+                                # For simplicity, we just skip unreadable chunks here.
+                                dump_file.write(b'\x00' * (end - start))
+            
+            print(f"[+] Success! Dump created: {self.output_filename} ({os.path.getsize(self.output_filename)/(1024*1024):.2f} MB)")
             return True
-        else:
-            print(f"[-] Memory dump failed. Error Code: {kernel32.GetLastError()}")
-            input("Press Enter to exit...")
+        except Exception as e:
+            print(f"[-] Linux dump failed: {e}")
             return False
-    finally:
-        if p_obj:
-            try:
-                p_obj.resume()
-                print(f"[*] Resumed process {pid}.")
-            except Exception as e:
-                print(f"[-] Failed to resume process {pid}: {e}")
+
+class TermuxDumper(LinuxDumper):
+    def elevate_privileges(self):
+        # Termux uses 'tsu' or 'sudo' if installed. tsu is more common.
+        for cmd in ['tsu', 'sudo']:
+            if subprocess.run(['which', cmd], capture_output=True).returncode == 0:
+                print(f"[*] Requesting root privileges via {cmd}...")
+                args = [cmd, '-c', f"{sys.executable} " + " ".join(sys.argv)]
+                os.execvp(cmd, [cmd, '-c', f"{sys.executable} " + " ".join(sys.argv)])
+        
+        print("[-] Could not find 'tsu' or 'sudo' for elevation in Termux.")
+        sys.exit(1)
+
+def get_dumper():
+    os_name = platform.system()
+    if os_name == "Windows":
+        return WindowsDumper
+    elif os_name == "Linux":
+        # Check if in Termux
+        if "TERMUX_VERSION" in os.environ or os.path.exists("/data/data/com.termux"):
+            return TermuxDumper
+        return LinuxDumper
+    else:
+        print(f"[-] Unsupported OS: {os_name}")
+        sys.exit(1)
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python dump_process.py <ProcessName.exe | PID>")
-        input("Press Enter to exit...")
+        print(f"Usage: python {os.path.basename(sys.argv[0])} <ProcessName | PID>")
         sys.exit(1)
-        
-    if not is_admin():
-        run_as_admin()
+
+    DumperClass = get_dumper()
+    dumper = DumperClass(sys.argv[1])
+
+    if not dumper.is_privileged():
+        dumper.elevate_privileges()
         return
 
-    target = sys.argv[1]
+    print(f"[*] Target Process: {dumper.process_name} (PID: {dumper.pid})")
     
-    # Check if target is a PID or a process name
-    if target.isdigit():
-        pid = int(target)
-        try:
-            p = psutil.Process(pid)
-            process_name = p.name()
-            output_filename = f"{process_name}.dmp" if process_name else f"process_{pid}.dmp"
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError):
-            output_filename = f"process_{pid}.dmp"
-    else:
-        pid = get_pid_by_name(target)
-        if pid is None:
-            print(f"[-] Could not find any running process named '{target}'.")
+    if dumper.pid == os.getpid():
+        print("[-] Cannot dump the current process (the dump program itself).")
+        if platform.system() == "Windows":
             input("Press Enter to exit...")
-            sys.exit(1)
-        output_filename = f"{target}.dmp"
-        
-    print(f"[*] Target Process: {target} (PID: {pid})")
-    create_memory_dump(pid, output_filename)
+        sys.exit(1)
 
-if __name__ == '__main__':
+    dumper.dump()
+    if platform.system() == "Windows":
+        input("Press Enter to exit...")
+
+if __name__ == "__main__":
     main()
