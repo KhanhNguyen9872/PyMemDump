@@ -43,10 +43,11 @@ Once you have the `.dmp` file, execute the main extractor against it.
 
 Rather than relying on static offsets or specific PyInstaller structures, this tool dynamically brute-force scans the entire memory space for:
 - Valid Zlib-compressed streams yielding Python `CodeObjects`.
-- Uncompressed raw `marshal` payloads (`\xe3\x00\x00\x00`).
+- Uncompressed raw `marshal` payloads (`\xe3\x00\x00\x00\x00`).
 - Dynamically loaded extensions (`.pyd`, `.dll`, `.so`).
+- **[NEW] Phase 6 Live Heap Scanning:** Dynamically resolves `PyCode_Type` from the native `python3X.dll` PE export table, and sweeps the entire virtual address space for raw C-struct pointers to bypass AES/Cython obfuscators that decrypt bytecode directly into memory without serialization!
 
-The script automatically detects the running Python Version (3.9 - 3.15) from the memory structures and prepends the exact matching `.pyc` magic header, allowing standard debuggers to decompile the output seamlessly.
+The script automatically detects the running Python Version (3.9 - 3.15) and builds the correctly patched `.pyc` magic header structures, allowing standard debuggers to decompile the output effortlessly.
 
 **Usage:**
 ```cmd
@@ -57,6 +58,8 @@ python main.py target_app.exe.dmp
 - Universal memory extraction for Python versions **3.9 through 3.15**.
 - Works out-of-the-box with **PyInstaller** and **PyArmor (v7 or below)**.
 - Extracts compiled bytecode (`.pyc`), binary extensions (`.pyd`), and shared libraries (`.dll`).
+- **[NEW] Analytics Engine**: Dumps an `all_objs.txt` trace of every live Python object in memory. For hidden payloads, automatically generates `analytics_<filename>.txt` reports featuring recursive `MAKE_FUNCTION` structure visualization and inline Python 3.12 Bytecode Disassembly!
+- **[NEW] Bypasses Cython + AES Loaders**: Rebuilds standard `.pyc` files strictly from heap memory struct offsets.
 - Automatically creates and organizes outputs within an extracted directory.
 - Deduplicates payload carving to provide you the cleanest application source possible.
 - Agnostic to the packaging tool: **any application or protector that dynamically loads a `.pyc` or Python code object into RAM can be dumped and extracted**.
