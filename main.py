@@ -9,6 +9,9 @@ import hashlib
 import pefile
 import re
 import struct
+import opcode
+
+from minidump.minidumpfile import MinidumpFile
 
 # Magic numbers for Python 3.9 - 3.15
 # Format: bytes magic + \x0d\x0d\x0a
@@ -179,7 +182,307 @@ def extract_zip_archives(data, out_dir):
     print(f"  [*] Extracted {zip_count} ZIP archives, {sqlite_count} SQLite databases, and {pyz_count} PYZ archives.")
 
 
+
+def extract_virtual_code_objects(dump_path, out_dir):
+    print("\n[*] ----- Phase 6: Scanning for Live PyCodeObjects in Virtual Memory -----")
+    try:
+        mf = MinidumpFile.parse(dump_path)
+        reader = mf.get_reader()
+    except Exception as e:
+        print(f"  [-] Failed to parse as Minidump: {e}")
+        return
+
+    # Find python DLL
+    py_base = None
+    py_size = None
+    py_name = None
+    for mod in mf.modules.modules:
+        name = mod.name.lower()
+        if 'python3' in name and name.endswith('.dll'):
+            py_base = mod.baseaddress
+            py_size = mod.size
+            py_name = mod.name
+            break
+
+    if not py_base:
+        print("  [-] Could not find python3X.dll in the minidump's loaded modules.")
+        return
+
+    print(f"  [+] Found {py_name} at base {hex(py_base)}")
+
+    # Read DLL headers from local system to avoid minidump page boundary errors
+    try:
+        import sys, os
+        dll_path = os.path.join(sys.base_exec_prefix, py_name)
+        if not os.path.exists(dll_path):
+            print(f"  [-] Could not find {py_name} locally at {dll_path} to resolve PyCode_Type.")
+            return
+            
+        pe = pefile.PE(dll_path)
+        pe.parse_data_directories([pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT']])
+        pycode_type_rva = None
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if exp.name == b'PyCode_Type':
+                    pycode_type_rva = exp.address
+                    break
+        if not pycode_type_rva:
+            print("  [-] Could not find PyCode_Type export in the Python DLL.")
+            return
+            
+        pycode_type_ptr = py_base + pycode_type_rva
+        print(f"  [+] PyCode_Type absolute pointer located at: {hex(pycode_type_ptr)}")
+    except Exception as e:
+        print(f"  [-] Error reading Python DLL locally: {e}")
+        return
+
+    # Scan virtual memory for this pointer
+    target_bytes = struct.pack("<Q", pycode_type_ptr)
+    
+    def read_str(addr):
+        if addr == 0: return ""
+        try:
+            head = reader.read(addr, 50)
+            length = struct.unpack("<q", head[16:24])[0]
+            if 0 < length < 1000:
+                for offset in (40, 48):
+                    try: return reader.read(addr + offset, length).decode('utf-8')
+                    except: pass
+            return ""
+        except Exception: return ""
+
+    def dump_tuple(addr):
+        if addr == 0: return tuple()
+        try:
+            head = reader.read(addr, 24)
+            size = struct.unpack("<q", head[16:24])[0]
+            if size < 0 or size > 1000: return tuple()
+            items = []
+            for i in range(size):
+                item_ptr = struct.unpack("<Q", reader.read(addr + 24 + i*8, 8))[0]
+                s = read_str(item_ptr)
+                if s:
+                    items.append(s)
+                else:
+                    # Placeholder for non-string constants (e.g. ints, None, nested code objs)
+                    # We inject a dummy integer so marshal doesn't fail
+                    items.append(i)
+            return tuple(items)
+        except Exception:
+            return tuple()
+
+    def dump_nested_codeobj(obj_addr, depth=0, outf=None):
+        prefix = "  " * depth
+        try:
+            struct_data = reader.read(obj_addr, 200)
+            co_consts_ptr = struct.unpack("<Q", struct_data[24:32])[0]
+            co_names_ptr = struct.unpack("<Q", struct_data[32:40])[0]
+            co_filename = struct.unpack("<Q", struct_data[112:120])[0]
+            co_name = struct.unpack("<Q", struct_data[120:128])[0]
+            
+            name_str = read_str(co_name)
+            filename_str = read_str(co_filename)
+            outf.write(f"{prefix}CodeObj @ {hex(obj_addr)}: name={name_str!r}, file={filename_str!r}\n")
+            
+            if co_names_ptr != 0:
+                try:
+                    head = reader.read(co_names_ptr, 24)
+                    size = struct.unpack("<q", head[16:24])[0]
+                    if 0 < size < 1000:
+                        names = []
+                        for i in range(size):
+                            item_ptr = struct.unpack("<Q", reader.read(co_names_ptr + 24 + i*8, 8))[0]
+                            names.append(read_str(item_ptr))
+                        outf.write(f"{prefix}  Names: {names}\n")
+                except: pass
+                
+            if co_consts_ptr != 0:
+                try:
+                    head = reader.read(co_consts_ptr, 24)
+                    size = struct.unpack("<q", head[16:24])[0]
+                    if 0 < size < 1000:
+                        for i in range(size):
+                            item_ptr = struct.unpack("<Q", reader.read(co_consts_ptr + 24 + i*8, 8))[0]
+                            s = read_str(item_ptr)
+                            if s:
+                                outf.write(f"{prefix}  Const[{i}]: (str) {s!r}\n")
+                            else:
+                                try:
+                                    item_type = struct.unpack("<Q", reader.read(item_ptr + 8, 8))[0]
+                                    if item_type == pycode_type_ptr:
+                                        outf.write(f"{prefix}  Const[{i}]: NESTED CODEOBJ\n")
+                                        dump_nested_codeobj(item_ptr, depth+2, outf)
+                                    else:
+                                        outf.write(f"{prefix}  Const[{i}]: <ptr {hex(item_ptr)} type {hex(item_type)}>\n")
+                                except: pass
+                except: pass
+        except Exception as e:
+            outf.write(f"{prefix}Error: {e}\n")
+
+    def disassemble_codeobj(obj_addr, outf=None):
+        try:
+            struct_data = reader.read(obj_addr, 200)
+            co_consts_ptr = struct.unpack("<Q", struct_data[24:32])[0]
+            co_names_ptr = struct.unpack("<Q", struct_data[32:40])[0]
+            co_filename = struct.unpack("<Q", struct_data[112:120])[0]
+            
+            consts = dump_tuple(co_consts_ptr)
+            names = tuple(str(x) for x in dump_tuple(co_names_ptr))
+            
+            outf.write(f"{'='*40}\nDisassembling CodeObj @ {hex(obj_addr)}\n{'='*40}\n")
+            outf.write(f"File: {read_str(co_filename)}\n")
+            outf.write(f"Names: {names}\n")
+            outf.write(f"Consts: {consts}\n\n")
+            
+            bytecode = reader.read(obj_addr + 160, 500)
+            
+            i = 0
+            while i < len(bytecode):
+                op = bytecode[i]
+                arg = bytecode[i+1]
+                
+                opname = opcode.opname[op]
+                if not opname.startswith("<"):
+                    argval = ""
+                    if opname in opcode.hasconst and arg < len(consts): argval = f"({consts[arg]})"
+                    elif opname in opcode.hasname and arg < len(names): argval = f"({names[arg]})"
+                    elif opname in opcode.hasjrel: argval = f"(to {i + 2 + arg*2})"
+                    elif opname in opcode.hasjabs: argval = f"(to {arg*2})"
+                    
+                    outf.write(f"{i:4} {opname:20} {arg} {argval}\n")
+                    if opname == 'RETURN_VALUE':
+                        break
+                i += 2
+        except Exception as e:
+            outf.write(f"Error disassembling: {e}\n")
+
+    def build_pyc_from_memory(obj_addr, name_str, out_path):
+        try:
+            struct_data = reader.read(obj_addr, 250)
+            
+            co_argcount = struct.unpack("<i", struct_data[0:4])[0]
+            co_posonlyargcount = struct.unpack("<i", struct_data[56:60])[0]
+            co_kwonlyargcount = struct.unpack("<i", struct_data[60:64])[0]
+            co_nlocals = struct.unpack("<i", struct_data[16:20])[0]
+            co_stacksize = struct.unpack("<i", struct_data[4:8])[0]
+            co_flags = struct.unpack("<i", struct_data[8:12])[0]
+            co_firstlineno = struct.unpack("<i", struct_data[40:44])[0]
+            
+            co_consts_ptr = struct.unpack("<Q", struct_data[24:32])[0]
+            co_names_ptr = struct.unpack("<Q", struct_data[32:40])[0]
+            co_varnames_ptr = struct.unpack("<Q", struct_data[48:56])[0]
+            co_filename_ptr = struct.unpack("<Q", struct_data[112:120])[0]
+            co_name_ptr = struct.unpack("<Q", struct_data[120:128])[0]
+            
+            consts = dump_tuple(co_consts_ptr)
+            names = dump_tuple(co_names_ptr)
+            varnames = dump_tuple(co_varnames_ptr)
+            filename = read_str(co_filename_ptr) or "unknown"
+            name = read_str(co_name_ptr) or "unknown"
+            
+            bytecode = reader.read(obj_addr + 160, 500) # heuristic read length
+            # truncate payload slightly for safety
+            
+            try:
+                # In Python 3.12, CodeType() constructor is extremely strict. 
+                # Create a generic dummy function and use its code object properties.
+                def dummy(): pass
+                c_dummy = dummy.__code__
+                
+                # Create a new code object dynamically matching Python 3.12 structure
+                # Because the raw memory could contain invalid jump targets, we construct
+                # a minimal valid code object preserving just the user's data fields
+                c = c_dummy.replace(
+                    co_consts=consts,
+                    co_names=names,
+                    co_varnames=varnames,
+                    co_filename=filename,
+                    co_name=name,
+                    co_qualname=name,
+                )
+                
+                pyc_bytes = build_pyc_header(PYTHON_MAGICS['3.12'], '3.12') + marshal.dumps(c)
+                
+                # Append raw bytecode as a separate readable block or comment if possible
+                with open(out_path, "wb") as f_out:
+                    f_out.write(pyc_bytes)
+                print(f"  [+] Reconstructed valid metadata PyCodeObject -> {out_path}")
+                
+                # Always dump hex to be safe because code instructions cannot be easily 
+                # injected into a clean `types.CodeType` instance without failing opcode assertions
+                with open(out_path + ".hex", "wb") as f_out:
+                    f_out.write(bytecode)
+                    
+            except Exception as e:
+                # Fallback if code.replace fails
+                print(f"  [-] Recompilation failed for {name_str}: {e}. Saving raw hex trace instead.")
+                with open(out_path + ".hex", "wb") as f_out:
+                    f_out.write(bytecode)
+                    
+        except Exception as e:
+            print(f"  [-] Error extracting PyCodeObject memory: {e}")
+
+    out_file = os.path.join(out_dir, "all_objs.txt")
+    print(f"  [*] Scanning all virtual segments... writing log to {out_file}")
+    
+    found = 0
+    with open(out_file, "w", encoding="utf-8") as outf:
+        outf.write(f"=== Live PyCodeObject Dump (Pointer: {hex(pycode_type_ptr)}) ===\n\n")
+        outf.write(f"{'Memory Address':<20} | {'Object Name':<40} | {'Defined Filename'}\n")
+        outf.write("-" * 100 + "\n")
+        
+        for segment in mf.memory_segments_64.memory_segments:
+            size = segment.size
+            addr = segment.start_virtual_address
+            try:
+                data = reader.read(addr, size)
+            except:
+                continue
+                
+            idx = 0
+            while True:
+                idx = data.find(target_bytes, idx)
+                if idx == -1: break
+                
+                obj_addr = addr + idx - 8 # offset to start of generic object struct
+                try:
+                    struct_data = reader.read(obj_addr, 200)
+                    
+                    # Offsets in 64-bit Python (rough heuristics for >= 3.10)
+                    co_filename = struct.unpack("<Q", struct_data[112:120])[0]
+                    co_name = struct.unpack("<Q", struct_data[120:128])[0]
+                    
+                    name_str = read_str(co_name)
+                    filename_str = read_str(co_filename)
+                    if name_str or filename_str:
+                        outf.write(f"{hex(obj_addr):<20} | {name_str:<40} | {filename_str}\n")
+                        found += 1
+                        
+                        # Check interesting payload targets user requested
+                        if '<_huynhngocuyen_system_runner' in filename_str or ('<module>' == name_str and '<string>' == filename_str):
+                            safe_file = filename_str.replace('<', '').replace('>', 'obj')
+                            
+                            out_path = os.path.join(out_dir, f"reconstructed_{safe_file}_{hex(obj_addr)}.pyc")
+                            build_pyc_from_memory(obj_addr, name_str, out_path)
+                            
+                            txt_path = os.path.join(out_dir, f"analytics_{safe_file}_{hex(obj_addr)}.txt")
+                            with open(txt_path, "w", encoding="utf-8") as analytics_file:
+                                analytics_file.write("--- NESTED CODEOBJ STRUCTURE ---\n")
+                                dump_nested_codeobj(obj_addr, 0, analytics_file)
+                                analytics_file.write("\n\n--- INLINE DISASSEMBLY (Python 3.12) ---\n")
+                                disassemble_codeobj(obj_addr, analytics_file)
+                            print(f"  [+] Saved deep analytics to -> {txt_path}")
+                            
+                except Exception:
+                    pass
+                    
+                idx += 8
+
+    print(f"  [+] Found {found} active PyCodeObjects in process heap.")
+
+
 def extract_from_memory_dump(dump_path):
+
     if not os.path.exists(dump_path):
         print(f"Error: Could not find '{dump_path}'")
         sys.exit(1)
@@ -536,7 +839,9 @@ def extract_from_memory_dump(dump_path):
             start = idx + 4
 
     extract_strings(data, os.path.join(out_dir, "strings.txt"))
+
     extract_zip_archives(data, out_dir)
+    extract_virtual_code_objects(dump_path, out_dir)
 
     print(f"\n[*] Finished! Successfully extracted {extracted_files} .pyc files and {extracted_pe} PE binaries to {out_dir}/")
     print(f"[*] You can now use decompyle3 or pycdc to decompile the extracted pyc files.")
@@ -550,8 +855,9 @@ if __name__ == '__main__':
         
     try:
         import pefile
+        from minidump.minidumpfile import MinidumpFile
     except ImportError:
-        print("[-] python-pefile is not installed. Please install it with 'pip install pefile'")
+        print("[-] Missing required libraries. Please install them with 'pip install pefile minidump'")
         sys.exit(1)
         
     extract_from_memory_dump(args.dump_file)
